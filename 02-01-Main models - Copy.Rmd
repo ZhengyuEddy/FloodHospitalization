@@ -1,0 +1,161 @@
+---
+title: "Main models"
+author: "Zhengyu Yang"
+date: '2023-07-24'
+output: html_document
+---
+
+# Library
+```{r}
+library(data.table); library(lubridate); library(tidyverse)
+library(dlnm); library(pbs); library(splines); library(mixmeta)
+```
+
+# Parameters
+```{r}
+city_inf <- readRDS("city_inf.rds")
+dataset <- readRDS(r"(..\Data\Dataset_used_for_analyses\Hospitalization.rds)")
+dataset[, flood_status := as.numeric(flood_status)-1]
+dataset[, dow := wday(date)]
+disease_name <-  c("All",
+                   "All_CVD","All_Resp","All_Infectious","All_Digestive","All_Mental",
+                   "All_Diabetes","All_Injury","All_Cancer","All_Nervous","All_Renal")
+
+stage2list <- list()
+l <- 210  # period of expected lag effect
+df <- 4  # degree of freedom for natural spline
+```
+
+# Function: stage1
+```{r}
+# out <- disease_name[1]
+fun_stage1 <- function(out) {
+  stage1list <- list()
+
+  # Set the outcome variable of interest
+  outcome <- out 
+
+  # Cities with the outcome will be investigated
+  tmp1 <- unique(dataset[!is.na(dataset[[outcome]]), LocIDLarge])
+  city_vector <- copy(tmp1)
+  
+  for (c in 1:length(city_vector)) {
+    c_no <- city_vector[c]
+    DT <- dataset[LocIDLarge==c_no,]
+    DT <- DT[order(date),]
+    daily_count <- mean(DT[[outcome]], na.rm = T)
+    
+    stage1list[[c_no]] <- tryCatch({
+      # Crossbasis for inundation
+      cb_flood <- crossbasis(DT$flood_status, lag=l,
+                                 argvar=list(fun="lin"),
+                                 arglag=list(fun="ns", df=df))
+      # Crossbasis for tmean
+      cb_tmean <- crossbasis(DT$tmean, lag=21,
+                             argvar=list(fun="bs", degree=2,
+                                         knots=quantile(DT$tmean, c(10,75,90)/100, na.rm=T)),
+                             arglag=list(knots=logknots(21, 2)))
+      # Crossbasis for rainfall
+      cb_rainfall <- crossbasis(DT$rainfall, lag=14,
+                             argvar=list(fun="bs", degree=2,
+                                         knots=quantile(DT$rainfall, c(10,75,90)/100, na.rm=T)),
+                             arglag=list(knots=logknots(14, 2)))  # Refer to "Rainfall events and daily mortality across 645 global locations: two stage time series analysis". Justification for including rainfall: "Floods and Diarrhea Risk in Young Children in Low- and Middle-Income Countries".
+      # One basis for seasonality
+      k_seas <- equalknots(yday(DT$date), 3)
+      b_seas <- onebasis(yday(DT$date), fun="pbs", knots=k_seas)
+      # Model
+      mformula <- formula(paste0(outcome," ~ cb_flood+cb_tmean+cb_rainfall+b_seas+bs(date,df=3)+dow"))  ##
+      mod <- glm(mformula, data=DT, family = quasipoisson, na.action = "na.exclude")
+
+      # Store results: coef/vcov, residuals, overdispersion
+      loglik <- sum(dpois(mod$y,mod$fitted.values,log=TRUE))
+      disp <- sum(residuals(mod,type="pearson")^2, na.rm=T)/mod$df.res
+      list(coef=coef(mod),
+           vcov=vcov(mod)
+           # dispersion=disp,
+           # residuals=residuals(mod, type="deviance")
+           )
+    }, error=function(cond){
+      NULL
+    })
+  }
+  return(stage1list)
+}
+```
+
+# Models and results
+```{r}
+stage1_list <- list()  # To store location-specific estimates
+stage2_list <- list()  # To store data for nonlinear plots
+stage2_result <- list()  # To store pooled estimates
+for(out in disease_name) {
+  tryCatch({
+    # Stage 1
+    stage1 <- fun_stage1(out)
+    stage1_list[[out]] <- stage1
+
+    # Stage 2
+    indpost <- grep("cb_flood", names(stage1[[1]]$coef))
+    coefpost <- t(sapply(stage1, function(x) x$coef[indpost]))
+    Scov <- lapply(stage1, function(x) x$vcov[indpost,indpost])
+    metapost <- mixmeta(coefpost, Scov, method="ml")
+
+    # For nonlinear plot
+    cb_flood <- crossbasis(dataset$flood_status, lag=l,
+                             argvar=list(fun="lin"),
+                             arglag=list(fun="ns", df=df))
+    bylag <- 0.1
+    cppost <- crosspred(basis=cb_flood, coef=coef(metapost), vcov=vcov(metapost),
+                        bylag=bylag, model.link="log", cen=0, at=1)
+    stage2_list[[out]] <- data.table(lag=seq(0,l,bylag),
+                                     rr=cppost$matRRfit[1,],
+                                     rrlow=cppost$matRRlow[1,],
+                                     rrhigh=cppost$matRRhigh[1,])
+
+    # Results: pooled estimates
+    ## Heterogeneity
+    I2 <- tryCatch({
+      I2 <- summary(metapost)[["i2stat"]][[".all"]]
+      paste0(format(round(I2,0),nsmall=0),"%")
+    }, error=function(cond){
+      return(NA)}
+    )
+    if (is.na(I2)) {
+      I2_p <- NA
+    } else {
+      I2_p <- summary(metapost)[["qstat"]][["pvalue"]][[".all"]]
+      I2_p <- if_else(I2_p>=0&I2_p<0.001,"<.001",format(round(I2_p,3),nsmall=3))
+    }
+
+    ## Save results
+    stage2_result[[out]] <- data.table(rr=cppost$allRRfit,
+                                       low=cppost$allRRlow,
+                                       high=cppost$allRRhigh,
+                                       estimate=paste0(format(round(cppost$allRRfit,3),nsmall=3),
+                                                       " (",
+                                                       format(round(cppost$allRRlow,3),nsmall=3),
+                                                       " to ",
+                                                       format(round(cppost$allRRhigh,3),nsmall=3),
+                                                       ")"),
+                                       `I-squared`=I2,
+                                       `p-value`=I2_p,
+                                       fit=cppost$allfit,
+                                       se=cppost$allse)
+  }, error = function(err) {
+    print(paste0("Error occurred in iteration ", out, ": ", conditionMessage(err)))
+  })
+}
+
+# Reorder the components
+stage1_list <- stage1_list[disease_name]
+stage2_result <- stage2_result[disease_name]
+stage2_list <- stage2_list[disease_name]
+
+# Save results as .rds files
+saveRDS(stage1_list, file=paste0("Results/Stage1/stage1_list_",l,"_df",df,".rds"))
+saveRDS(stage2_list, file=paste0("Results/Stage2/stage2_list_",l,"_df",df,".rds"))
+saveRDS(stage2_result, file=paste0("Results/Stage2/stage2_result_",l,"_df",df,".rds"))
+stage1_list <- readRDS(paste0("Results/Stage1/stage1_list_",l,"_df",df,".rds"))
+stage2_list <- readRDS(paste0("Results/Stage2/stage2_list_",l,"_df",df,".rds"))
+stage2_result <- readRDS(paste0("Results/Stage2/stage2_result_",l,"_df",df,".rds"))
+```
